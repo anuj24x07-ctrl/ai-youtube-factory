@@ -13,9 +13,9 @@ import edge_tts
 from PIL import Image, ImageDraw, ImageFont
 
 
-# =========================
-# CONFIGURATION
-# =========================
+# ==================================================
+# CONFIG
+# ==================================================
 
 OUT = Path("output")
 OUT.mkdir(exist_ok=True)
@@ -23,10 +23,20 @@ OUT.mkdir(exist_ok=True)
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 PIXABAY_KEY = os.environ["PIXABAY_API_KEY"]
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+PIXABAY_URL = "https://pixabay.com/api/videos/"
+
+PREFERRED_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash"
+]
 
 CACHE_FILE = OUT / "pixabay_cache.json"
-CACHE_HOURS = 24
+CACHE_SECONDS = 24 * 60 * 60
 
 TOPICS = [
     "Why astronauts grow slightly taller in space",
@@ -42,104 +52,248 @@ TOPICS = [
 ]
 
 
-# =========================
+# ==================================================
+# GEMINI MODEL DISCOVERY
+# ==================================================
+
+def get_available_models():
+
+    print("Checking available Gemini models...")
+
+    try:
+        response = requests.get(
+            f"{API_BASE}/models",
+            params={"key": GEMINI_KEY},
+            timeout=30
+        )
+
+        response.raise_for_status()
+
+        models = response.json().get("models", [])
+
+        available = []
+
+        for item in models:
+
+            name = item.get("name", "")
+            methods = item.get("supportedGenerationMethods", [])
+
+            if (
+                "gemini" in name.lower()
+                and "generateContent" in methods
+            ):
+                available.append(
+                    name.replace("models/", "")
+                )
+
+        ordered = []
+
+        # User-provided model preference, if configured.
+        custom = os.getenv("GEMINI_MODEL", "").strip()
+
+        if custom and custom in available:
+            ordered.append(custom)
+
+        # Preferred stable models first.
+        for model in PREFERRED_MODELS:
+            if model in available and model not in ordered:
+                ordered.append(model)
+
+        # Any other supported Gemini models.
+        for model in available:
+            if model not in ordered:
+                ordered.append(model)
+
+        if ordered:
+            print("Available models:", ", ".join(ordered[:6]))
+            return ordered
+
+    except Exception as error:
+        print("Model discovery warning:", str(error))
+
+    print("Using fallback model list.")
+
+    custom = os.getenv("GEMINI_MODEL", "").strip()
+
+    fallback = []
+
+    if custom:
+        fallback.append(custom)
+
+    for model in PREFERRED_MODELS:
+        if model not in fallback:
+            fallback.append(model)
+
+    return fallback
+
+
+# ==================================================
 # GEMINI SCRIPT GENERATION
-# =========================
+# ==================================================
 
 def make_script():
 
     topic = random.choice(TOPICS)
 
     prompt = f"""
-Create an original, fact-focused YouTube Short script about:
+Create an original, fact-focused YouTube Short script.
 
-{topic}
+TOPIC: {topic}
 
-Audience: General US audience.
-Language: Natural American English.
-Duration: 35-50 seconds.
+AUDIENCE:
+General US audience.
 
-Requirements:
+LANGUAGE:
+Natural American English.
+
+DURATION:
+35-50 seconds.
+
+RULES:
 - Narration must contain 90-115 words.
 - Start with a compelling but truthful hook.
-- Use clear, engaging storytelling.
-- Do not invent facts or statistics.
-- Avoid sensational misinformation.
-- Avoid copyrighted characters and copied scripts.
+- Use engaging storytelling.
+- Do not invent facts, statistics or scientific claims.
+- Avoid misleading clickbait.
+- Avoid copyrighted characters.
+- Do not copy existing scripts.
+- Make the ending memorable.
 
 Return ONLY valid JSON with these keys:
 
-title (max 65 characters)
-hook
-narration
-visual_search (2-5 simple Pixabay search terms)
-thumbnail_text (2-4 words)
-description
-tags (array)
-fact_check_notes (array of claims requiring verification)
+{{
+  "title": "Maximum 65 characters",
+  "hook": "Opening hook",
+  "narration": "90-115 word narration",
+  "visual_search": ["search term 1", "search term 2"],
+  "thumbnail_text": "2-4 words",
+  "description": "YouTube description",
+  "tags": ["tag1", "tag2"],
+  "fact_check_notes": ["claim to verify"]
+}}
 """
 
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{MODEL}:generateContent"
+    models = get_available_models()
+
+    last_error = None
+
+    for model in models:
+
+        print("Trying Gemini model:", model)
+
+        url = f"{API_BASE}/models/{model}:generateContent"
+
+        try:
+
+            response = requests.post(
+                url,
+                params={"key": GEMINI_KEY},
+                json={
+                    "contents": [
+                        {
+                            "parts": [
+                                {"text": prompt}
+                            ]
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": 0.7,
+                        "responseMimeType": "application/json"
+                    }
+                },
+                timeout=120
+            )
+
+            if response.status_code == 404:
+                print("Model unavailable. Trying next model.")
+                last_error = response.text
+                continue
+
+            if not response.ok:
+                print("Gemini API status:", response.status_code)
+                print("Gemini API response:", response.text)
+                response.raise_for_status()
+
+            result = response.json()
+
+            candidates = result.get("candidates", [])
+
+            if not candidates:
+                raise RuntimeError(
+                    "Gemini returned no candidates: "
+                    + json.dumps(result)[:1500]
+                )
+
+            parts = candidates[0].get(
+                "content", {}
+            ).get("parts", [])
+
+            raw = "".join(
+                part.get("text", "")
+                for part in parts
+            ).strip()
+
+            raw = re.sub(
+                r"^```(?:json)?\s*|\s*```$",
+                "",
+                raw,
+                flags=re.I
+            )
+
+            data = json.loads(raw)
+
+            required = [
+                "title",
+                "narration",
+                "visual_search",
+                "thumbnail_text",
+                "description",
+                "tags",
+                "fact_check_notes"
+            ]
+
+            for field in required:
+                if field not in data:
+                    raise ValueError(
+                        f"Missing Gemini field: {field}"
+                    )
+
+            if not isinstance(data["visual_search"], list):
+                raise ValueError("visual_search must be a list")
+
+            if not isinstance(data["narration"], str):
+                raise ValueError("narration must be text")
+
+            (OUT / "script.json").write_text(
+                json.dumps(
+                    data,
+                    indent=2,
+                    ensure_ascii=False
+                ),
+                encoding="utf-8"
+            )
+
+            print("Script generated using:", model)
+
+            return data
+
+        except requests.HTTPError:
+            raise
+
+        except Exception as error:
+            last_error = str(error)
+            print("Model attempt failed:", last_error)
+            break
+
+    raise RuntimeError(
+        "Gemini script generation failed. Last error: "
+        + str(last_error)
     )
 
-    response = requests.post(
-        url,
-        params={"key": GEMINI_KEY},
-        json={
-            "contents": [
-                {"parts": [{"text": prompt}]}
-            ],
-            "generationConfig": {
-                "temperature": 0.7,
-                "responseMimeType": "application/json"
-            }
-        },
-        timeout=90
-    )
 
-    response.raise_for_status()
-
-    raw = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-    raw = re.sub(
-        r"^```(?:json)?\s*|\s*```$",
-        "",
-        raw.strip(),
-        flags=re.I
-    )
-
-    data = json.loads(raw)
-
-    required = [
-        "title",
-        "narration",
-        "visual_search",
-        "thumbnail_text",
-        "description",
-        "tags",
-        "fact_check_notes"
-    ]
-
-    for field in required:
-        if field not in data:
-            raise ValueError(f"Gemini response missing field: {field}")
-
-    if not isinstance(data["visual_search"], list):
-        raise ValueError("visual_search must be a list")
-
-    (OUT / "script.json").write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
-        encoding="utf-8"
-    )
-
-    return data
-
-
-# =========================
+# ==================================================
 # PIXABAY CACHE
-# =========================
+# ==================================================
 
 def load_cache():
 
@@ -147,7 +301,9 @@ def load_cache():
         return {}
 
     try:
-        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        return json.loads(
+            CACHE_FILE.read_text(encoding="utf-8")
+        )
     except Exception:
         return {}
 
@@ -160,9 +316,9 @@ def save_cache(cache):
     )
 
 
-# =========================
+# ==================================================
 # PIXABAY VIDEO SEARCH
-# =========================
+# ==================================================
 
 def search_pixabay(query):
 
@@ -174,11 +330,14 @@ def search_pixabay(query):
     if cached:
         age = now - cached.get("timestamp", 0)
 
-        if age < CACHE_HOURS * 3600:
+        if age < CACHE_SECONDS:
+            print("Using cached Pixabay results.")
             return cached.get("results", [])
 
+    print("Searching Pixabay:", query)
+
     response = requests.get(
-        "https://pixabay.com/api/videos/",
+        PIXABAY_URL,
         params={
             "key": PIXABAY_KEY,
             "q": query,
@@ -186,10 +345,12 @@ def search_pixabay(query):
             "safesearch": "true",
             "order": "popular"
         },
-        timeout=45
+        timeout=60
     )
 
-    response.raise_for_status()
+    if not response.ok:
+        print("Pixabay API error:", response.text)
+        response.raise_for_status()
 
     hits = response.json().get("hits", [])
 
@@ -197,14 +358,13 @@ def search_pixabay(query):
 
     for hit in hits:
 
-        videos = hit.get("videos", {})
+        video_sizes = hit.get("videos", {})
 
         selected = None
 
-        # Prefer medium or small files to reduce download size.
         for size in ["medium", "small", "large", "tiny"]:
 
-            video = videos.get(size)
+            video = video_sizes.get(size)
 
             if video and video.get("url"):
                 selected = video
@@ -233,43 +393,44 @@ def search_pixabay(query):
 
 def get_pixabay_video(queries):
 
-    all_results = []
+    if not queries:
+        queries = ["science space"]
 
+    # Stop after the first successful search.
     for query in queries:
-
-        print("Searching Pixabay:", query)
 
         results = search_pixabay(query)
 
-        if results:
-            all_results.extend(results)
+        if not results:
+            continue
 
-    if not all_results:
-        raise RuntimeError(
-            "No Pixabay videos found. Try different search terms."
+        portrait = [
+            item for item in results
+            if item["height"] > item["width"]
+        ]
+
+        pool = portrait if portrait else results
+
+        selected = random.choice(pool)
+
+        (OUT / "asset_info.json").write_text(
+            json.dumps(selected, indent=2),
+            encoding="utf-8"
         )
 
-    # Prefer portrait videos where available.
-    portrait = [
-        item for item in all_results
-        if item["height"] > item["width"]
-    ]
+        print("Selected Pixabay video.")
+        print("Source:", selected.get("page_url", "Pixabay"))
 
-    selected_pool = portrait if portrait else all_results
+        return selected["url"]
 
-    selected = random.choice(selected_pool)
-
-    (OUT / "asset_info.json").write_text(
-        json.dumps(selected, indent=2),
-        encoding="utf-8"
+    raise RuntimeError(
+        "No Pixabay videos found. Try different search terms."
     )
 
-    return selected["url"]
 
-
-# =========================
-# DOWNLOAD VIDEO
-# =========================
+# ==================================================
+# DOWNLOAD
+# ==================================================
 
 def download(url, path):
 
@@ -283,15 +444,19 @@ def download(url, path):
 
         with open(path, "wb") as file:
 
-            for chunk in response.iter_content(1024 * 256):
-
+            for chunk in response.iter_content(
+                chunk_size=256 * 1024
+            ):
                 if chunk:
                     file.write(chunk)
 
+    if not path.exists() or path.stat().st_size == 0:
+        raise RuntimeError("Downloaded video is empty.")
 
-# =========================
+
+# ==================================================
 # AI VOICEOVER
-# =========================
+# ==================================================
 
 async def make_voice(text, path):
 
@@ -304,9 +469,9 @@ async def make_voice(text, path):
     await communicate.save(str(path))
 
 
-# =========================
-# THUMBNAIL GENERATOR
-# =========================
+# ==================================================
+# THUMBNAIL
+# ==================================================
 
 def make_thumbnail(text):
 
@@ -385,9 +550,9 @@ def make_thumbnail(text):
     )
 
 
-# =========================
-# SHORT VIDEO RENDERER
-# =========================
+# ==================================================
+# VIDEO RENDERING
+# ==================================================
 
 def render(video_url, narration):
 
@@ -395,23 +560,25 @@ def render(video_url, narration):
     voice = OUT / "voice.mp3"
     final = OUT / "short.mp4"
 
-    print("Downloading stock video...")
+    print("Downloading stock footage...")
 
     download(video_url, raw_video)
 
-    print("Generating AI voiceover...")
+    print("Generating voiceover...")
 
     asyncio.run(
         make_voice(narration, voice)
     )
 
-    print("Rendering YouTube Short...")
+    print("Rendering vertical video...")
 
     command = [
         "ffmpeg",
         "-y",
+
         "-stream_loop", "-1",
         "-i", str(raw_video),
+
         "-i", str(voice),
 
         "-vf",
@@ -446,24 +613,29 @@ def render(video_url, narration):
 
     raw_video.unlink(missing_ok=True)
 
-    print("Video rendering completed.")
+    if not final.exists() or final.stat().st_size == 0:
+        raise RuntimeError("Final video was not created.")
+
+    print("Video rendering complete.")
 
 
-# =========================
+# ==================================================
 # MAIN
-# =========================
+# ==================================================
 
 def main():
 
-    print("Starting AI YouTube Factory...")
+    print("=" * 45)
+    print("       AI YOUTUBE FACTORY")
+    print("=" * 45)
 
-    print("Step 1: Generating script")
+    print("\nSTEP 1: Generating script")
 
     data = make_script()
 
-    print("Title:", data["title"])
+    print("\nTITLE:", data["title"])
 
-    print("Step 2: Searching Pixabay")
+    print("\nSTEP 2: Finding Pixabay footage")
 
     video_url = get_pixabay_video(
         data.get(
@@ -472,14 +644,14 @@ def main():
         )
     )
 
-    print("Step 3: Creating video")
+    print("\nSTEP 3: Creating voice and video")
 
     render(
         video_url,
         data["narration"]
     )
 
-    print("Step 4: Creating thumbnail")
+    print("\nSTEP 4: Creating thumbnail")
 
     make_thumbnail(
         data.get(
@@ -488,18 +660,21 @@ def main():
         )
     )
 
-    print("\nSUCCESS!")
+    print("\n" + "=" * 45)
+    print("             SUCCESS")
+    print("=" * 45)
 
-    print("Created files:")
+    print("\nGenerated files:")
 
-    print("- output/short.mp4")
-    print("- output/thumbnail.jpg")
-    print("- output/script.json")
-    print("- output/asset_info.json")
+    print("output/short.mp4")
+    print("output/thumbnail.jpg")
+    print("output/script.json")
+    print("output/asset_info.json")
+    print("output/pixabay_cache.json")
 
-    print("\nReview fact_check_notes before publishing.")
+    print("\nReview facts and footage before publishing.")
 
 
 if __name__ == "__main__":
     main()
-    
+            

@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 # ==================================================
-# CONFIG
+# CONFIGURATION
 # ==================================================
 
 OUT = Path("output")
@@ -26,17 +26,20 @@ PIXABAY_KEY = os.environ["PIXABAY_API_KEY"]
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 PIXABAY_URL = "https://pixabay.com/api/videos/"
 
-PREFERRED_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-2.5-flash"
-]
-
 CACHE_FILE = OUT / "pixabay_cache.json"
 CACHE_SECONDS = 24 * 60 * 60
+
+# Try less-loaded alternatives first.
+PREFERRED_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash"
+]
+
+RETRY_STATUS_CODES = [429, 500, 502, 503, 504]
 
 TOPICS = [
     "Why astronauts grow slightly taller in space",
@@ -58,7 +61,7 @@ TOPICS = [
 
 def get_available_models():
 
-    print("Checking available Gemini models...")
+    print("\nChecking available Gemini models...")
 
     try:
         response = requests.get(
@@ -67,64 +70,52 @@ def get_available_models():
             timeout=30
         )
 
-        response.raise_for_status()
+        if not response.ok:
+            print("Model discovery response:", response.text)
+            response.raise_for_status()
 
-        models = response.json().get("models", [])
+        items = response.json().get("models", [])
 
         available = []
 
-        for item in models:
+        for item in items:
 
-            name = item.get("name", "")
+            name = item.get("name", "").replace("models/", "")
             methods = item.get("supportedGenerationMethods", [])
 
             if (
-                "gemini" in name.lower()
+                name.startswith("gemini-")
                 and "generateContent" in methods
             ):
-                available.append(
-                    name.replace("models/", "")
-                )
+                available.append(name)
 
         ordered = []
 
-        # User-provided model preference, if configured.
         custom = os.getenv("GEMINI_MODEL", "").strip()
 
         if custom and custom in available:
             ordered.append(custom)
 
-        # Preferred stable models first.
         for model in PREFERRED_MODELS:
             if model in available and model not in ordered:
                 ordered.append(model)
 
-        # Any other supported Gemini models.
         for model in available:
             if model not in ordered:
                 ordered.append(model)
 
         if ordered:
-            print("Available models:", ", ".join(ordered[:6]))
+            print("Models available:", ", ".join(ordered))
             return ordered
 
+        raise RuntimeError("No supported Gemini models found.")
+
     except Exception as error:
-        print("Model discovery warning:", str(error))
-
-    print("Using fallback model list.")
-
-    custom = os.getenv("GEMINI_MODEL", "").strip()
-
-    fallback = []
-
-    if custom:
-        fallback.append(custom)
-
-    for model in PREFERRED_MODELS:
-        if model not in fallback:
-            fallback.append(model)
-
-    return fallback
+        print("Model discovery failed:", str(error))
+        raise RuntimeError(
+            "Could not retrieve Gemini model list. "
+            "Check API key and Gemini API access."
+        )
 
 
 # ==================================================
@@ -149,7 +140,7 @@ Natural American English.
 DURATION:
 35-50 seconds.
 
-RULES:
+REQUIREMENTS:
 - Narration must contain 90-115 words.
 - Start with a compelling but truthful hook.
 - Use engaging storytelling.
@@ -175,119 +166,146 @@ Return ONLY valid JSON with these keys:
 
     models = get_available_models()
 
-    last_error = None
+    last_error = "No model succeeded."
 
     for model in models:
 
-        print("Trying Gemini model:", model)
+        print("\nTrying Gemini model:", model)
 
         url = f"{API_BASE}/models/{model}:generateContent"
 
-        try:
+        # Two attempts per model for temporary server problems.
+        for attempt in range(2):
 
-            response = requests.post(
-                url,
-                params={"key": GEMINI_KEY},
-                json={
-                    "contents": [
-                        {
-                            "parts": [
-                                {"text": prompt}
-                            ]
+            try:
+
+                response = requests.post(
+                    url,
+                    params={"key": GEMINI_KEY},
+                    json={
+                        "contents": [
+                            {
+                                "parts": [
+                                    {"text": prompt}
+                                ]
+                            }
+                        ],
+                        "generationConfig": {
+                            "temperature": 0.7,
+                            "responseMimeType": "application/json"
                         }
-                    ],
-                    "generationConfig": {
-                        "temperature": 0.7,
-                        "responseMimeType": "application/json"
-                    }
-                },
-                timeout=120
-            )
-
-            if response.status_code == 404:
-                print("Model unavailable. Trying next model.")
-                last_error = response.text
-                continue
-
-            if not response.ok:
-                print("Gemini API status:", response.status_code)
-                print("Gemini API response:", response.text)
-                response.raise_for_status()
-
-            result = response.json()
-
-            candidates = result.get("candidates", [])
-
-            if not candidates:
-                raise RuntimeError(
-                    "Gemini returned no candidates: "
-                    + json.dumps(result)[:1500]
+                    },
+                    timeout=120
                 )
 
-            parts = candidates[0].get(
-                "content", {}
-            ).get("parts", [])
+                if response.status_code in RETRY_STATUS_CODES:
 
-            raw = "".join(
-                part.get("text", "")
-                for part in parts
-            ).strip()
-
-            raw = re.sub(
-                r"^```(?:json)?\s*|\s*```$",
-                "",
-                raw,
-                flags=re.I
-            )
-
-            data = json.loads(raw)
-
-            required = [
-                "title",
-                "narration",
-                "visual_search",
-                "thumbnail_text",
-                "description",
-                "tags",
-                "fact_check_notes"
-            ]
-
-            for field in required:
-                if field not in data:
-                    raise ValueError(
-                        f"Missing Gemini field: {field}"
+                    last_error = (
+                        f"HTTP {response.status_code}: "
+                        f"{response.text[:1000]}"
                     )
 
-            if not isinstance(data["visual_search"], list):
-                raise ValueError("visual_search must be a list")
+                    print("Temporary Gemini error:", response.status_code)
 
-            if not isinstance(data["narration"], str):
-                raise ValueError("narration must be text")
+                    if attempt == 0:
+                        wait = 8
+                        print(f"Retrying same model in {wait} seconds...")
+                        time.sleep(wait)
+                        continue
 
-            (OUT / "script.json").write_text(
-                json.dumps(
-                    data,
-                    indent=2,
-                    ensure_ascii=False
-                ),
-                encoding="utf-8"
-            )
+                    print("Trying another Gemini model...")
+                    break
 
-            print("Script generated using:", model)
+                if response.status_code == 404:
 
-            return data
+                    last_error = response.text[:1000]
+                    print("Model not available. Switching model...")
+                    break
 
-        except requests.HTTPError:
-            raise
+                if not response.ok:
 
-        except Exception as error:
-            last_error = str(error)
-            print("Model attempt failed:", last_error)
-            break
+                    print("\nGemini API error:", response.status_code)
+                    print(response.text[:2000])
+
+                    response.raise_for_status()
+
+                result = response.json()
+
+                candidates = result.get("candidates", [])
+
+                if not candidates:
+                    last_error = (
+                        "Gemini returned no candidates: "
+                        + json.dumps(result)[:1000]
+                    )
+                    print(last_error)
+                    break
+
+                parts = candidates[0].get(
+                    "content", {}
+                ).get("parts", [])
+
+                raw = "".join(
+                    part.get("text", "")
+                    for part in parts
+                ).strip()
+
+                raw = re.sub(
+                    r"^```(?:json)?\s*|\s*```$",
+                    "",
+                    raw,
+                    flags=re.I
+                )
+
+                data = json.loads(raw)
+
+                required = [
+                    "title",
+                    "narration",
+                    "visual_search",
+                    "thumbnail_text",
+                    "description",
+                    "tags",
+                    "fact_check_notes"
+                ]
+
+                for field in required:
+                    if field not in data:
+                        raise ValueError(
+                            f"Missing field: {field}"
+                        )
+
+                if not isinstance(data["narration"], str):
+                    raise ValueError("Narration must be text.")
+
+                if not isinstance(data["visual_search"], list):
+                    raise ValueError("visual_search must be a list.")
+
+                (OUT / "script.json").write_text(
+                    json.dumps(
+                        data,
+                        indent=2,
+                        ensure_ascii=False
+                    ),
+                    encoding="utf-8"
+                )
+
+                print("\nScript successfully generated!")
+                print("Model used:", model)
+
+                return data
+
+            except requests.HTTPError:
+                raise
+
+            except (requests.RequestException, json.JSONDecodeError, ValueError) as error:
+
+                last_error = str(error)
+                print("Attempt failed:", last_error)
+                break
 
     raise RuntimeError(
-        "Gemini script generation failed. Last error: "
-        + str(last_error)
+        "All Gemini models failed. Last error: " + last_error
     )
 
 
@@ -349,7 +367,7 @@ def search_pixabay(query):
     )
 
     if not response.ok:
-        print("Pixabay API error:", response.text)
+        print("Pixabay error:", response.text[:1500])
         response.raise_for_status()
 
     hits = response.json().get("hits", [])
@@ -359,7 +377,6 @@ def search_pixabay(query):
     for hit in hits:
 
         video_sizes = hit.get("videos", {})
-
         selected = None
 
         for size in ["medium", "small", "large", "tiny"]:
@@ -396,7 +413,6 @@ def get_pixabay_video(queries):
     if not queries:
         queries = ["science space"]
 
-    # Stop after the first successful search.
     for query in queries:
 
         results = search_pixabay(query)
@@ -418,8 +434,7 @@ def get_pixabay_video(queries):
             encoding="utf-8"
         )
 
-        print("Selected Pixabay video.")
-        print("Source:", selected.get("page_url", "Pixabay"))
+        print("Selected video:", selected.get("page_url", ""))
 
         return selected["url"]
 
@@ -429,7 +444,7 @@ def get_pixabay_video(queries):
 
 
 # ==================================================
-# DOWNLOAD
+# DOWNLOAD VIDEO
 # ==================================================
 
 def download(url, path):
@@ -470,7 +485,7 @@ async def make_voice(text, path):
 
 
 # ==================================================
-# THUMBNAIL
+# THUMBNAIL GENERATOR
 # ==================================================
 
 def make_thumbnail(text):
@@ -560,17 +575,17 @@ def render(video_url, narration):
     voice = OUT / "voice.mp3"
     final = OUT / "short.mp4"
 
-    print("Downloading stock footage...")
+    print("\nDownloading stock footage...")
 
     download(video_url, raw_video)
 
-    print("Generating voiceover...")
+    print("\nGenerating AI voiceover...")
 
     asyncio.run(
         make_voice(narration, voice)
     )
 
-    print("Rendering vertical video...")
+    print("\nRendering vertical video...")
 
     command = [
         "ffmpeg",
@@ -616,7 +631,7 @@ def render(video_url, narration):
     if not final.exists() or final.stat().st_size == 0:
         raise RuntimeError("Final video was not created.")
 
-    print("Video rendering complete.")
+    print("Video successfully rendered!")
 
 
 # ==================================================
@@ -626,7 +641,7 @@ def render(video_url, narration):
 def main():
 
     print("=" * 45)
-    print("       AI YOUTUBE FACTORY")
+    print("        AI YOUTUBE FACTORY")
     print("=" * 45)
 
     print("\nSTEP 1: Generating script")
@@ -635,7 +650,7 @@ def main():
 
     print("\nTITLE:", data["title"])
 
-    print("\nSTEP 2: Finding Pixabay footage")
+    print("\nSTEP 2: Finding stock footage")
 
     video_url = get_pixabay_video(
         data.get(
@@ -661,20 +676,19 @@ def main():
     )
 
     print("\n" + "=" * 45)
-    print("             SUCCESS")
+    print("              SUCCESS")
     print("=" * 45)
 
     print("\nGenerated files:")
+    print("- output/short.mp4")
+    print("- output/thumbnail.jpg")
+    print("- output/script.json")
+    print("- output/asset_info.json")
+    print("- output/pixabay_cache.json")
 
-    print("output/short.mp4")
-    print("output/thumbnail.jpg")
-    print("output/script.json")
-    print("output/asset_info.json")
-    print("output/pixabay_cache.json")
-
-    print("\nReview facts and footage before publishing.")
+    print("\nPlease review factual claims and footage before publishing.")
 
 
 if __name__ == "__main__":
     main()
-            
+    
